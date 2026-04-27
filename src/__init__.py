@@ -1,0 +1,1 @@
+"""Pathological gait recognition package."""

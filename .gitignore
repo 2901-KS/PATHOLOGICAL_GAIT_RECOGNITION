@@ -1,0 +1,8 @@
+data/raw/
+data/processed/
+models/*.joblib
+models/*.pt
+models/*.json
+__pycache__/
+.streamlit/
+.ipynb_checkpoints/
