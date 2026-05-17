@@ -11,8 +11,8 @@ import requests
 from tqdm import tqdm
 
 
-FIGSHARE_ARTICLE_ID = "12162300"
-FIGSHARE_API_URL = f"https://api.figshare.com/v2/articles/{FIGSHARE_ARTICLE_ID}"
+FIGSHARE_COLLECTION_ID = "4788012"
+FIGSHARE_COLLECTION_URL = f"https://api.figshare.com/v2/collections/{FIGSHARE_COLLECTION_ID}/articles"
 
 SIGNAL_FILES = [
     "GRF_F_V_PRO_left.csv",
@@ -39,47 +39,61 @@ class GaitRecPaths:
         return self.root / "processed"
 
 
-def fetch_figshare_file_index() -> list[dict]:
-    response = requests.get(FIGSHARE_API_URL, timeout=30)
-    response.raise_for_status()
-    article = response.json()
-    return article.get("files", [])
+def fetch_figshare_collection_file_index(wanted: set) -> dict:
+    """Scan all articles in the GaitRec Figshare collection and return download info for wanted files."""
+    file_index = {}
+    page = 1
+    while True:
+        response = requests.get(
+            FIGSHARE_COLLECTION_URL,
+            params={"page": page, "page_size": 50},
+            timeout=30,
+        )
+        response.raise_for_status()
+        articles = response.json()
+        if not articles:
+            break
+        for article in articles:
+            r2 = requests.get(
+                f"https://api.figshare.com/v2/articles/{article['id']}", timeout=30
+            )
+            r2.raise_for_status()
+            for f in r2.json().get("files", []):
+                name = f["name"]
+                canonical = METADATA_FILE if name in METADATA_ALIASES else name
+                if canonical in wanted and canonical not in file_index:
+                    file_index[canonical] = (f["download_url"], f.get("size", 0))
+            if set(file_index.keys()) >= wanted:
+                break
+        page += 1
+    return file_index
 
 
 def download_gaitrec(data_root: str | Path = "data", files: Iterable[str] | None = None) -> None:
-    """Download selected GaitRec CSV files from Figshare.
+    """Download selected GaitRec CSV files from the Figshare collection.
 
-    The full article is large, so the default fetches only processed GRF files needed by
-    this project plus metadata.
+    Files are spread across multiple articles inside collection 4788012.
+    The default fetches only the six processed GRF channel files and metadata.
     """
     paths = GaitRecPaths(Path(data_root))
     paths.raw.mkdir(parents=True, exist_ok=True)
     wanted = set(files or [METADATA_FILE, *SIGNAL_FILES])
-    index = fetch_figshare_file_index()
-    (paths.raw / "figshare_files.json").write_text(json.dumps(index, indent=2), encoding="utf-8")
 
-    by_name = {item["name"]: item for item in index}
-
-    def resolve_file(name: str) -> dict:
-        if name in by_name:
-            return by_name[name]
-        if name in METADATA_ALIASES:
-            for alias in METADATA_ALIASES:
-                if alias in by_name:
-                    return by_name[alias]
-        normalized = name.lower().replace("-", "_")
-        for hosted_name, item in by_name.items():
-            if hosted_name.lower().replace("-", "_") == normalized:
-                return item
-        raise FileNotFoundError(f"Figshare article is missing expected file: {name}")
+    file_index = fetch_figshare_collection_file_index(wanted)
+    (paths.raw / "figshare_files.json").write_text(
+        json.dumps({k: v[0] for k, v in file_index.items()}, indent=2), encoding="utf-8"
+    )
 
     for name in sorted(wanted):
-        item = resolve_file(name)
+        if name not in file_index:
+            raise FileNotFoundError(
+                f"Could not find '{name}' in Figshare collection {FIGSHARE_COLLECTION_ID}."
+            )
+        url, size = file_index[name]
         target = paths.raw / name
-        if target.exists() and target.stat().st_size == item.get("size"):
+        if target.exists() and target.stat().st_size == size:
             continue
-        url = item["download_url"]
-        with requests.get(url, stream=True, timeout=60) as response:
+        with requests.get(url, stream=True, timeout=120) as response:
             response.raise_for_status()
             total = int(response.headers.get("content-length", 0))
             with target.open("wb") as handle, tqdm(

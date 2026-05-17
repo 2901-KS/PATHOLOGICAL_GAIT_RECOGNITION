@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import joblib
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
+
+if __package__ in {None, ""}:
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from src.gait_data import build_dataset, download_gaitrec, feature_columns
 
@@ -29,6 +33,7 @@ def train_baseline(
     target: str = "target_binary",
     model_type: str = "histgb",
     rebuild: bool = False,
+    max_trials: int | None = None,
 ) -> dict:
     data_root = Path(data_root)
     model_dir = Path(model_dir)
@@ -36,6 +41,17 @@ def train_baseline(
     df = pd.read_parquet(dataset_path)
     feats = feature_columns(df)
     df = df.dropna(subset=[target])
+    if max_trials and len(df) > max_trials:
+        stratify_col = target if df[target].nunique() > 1 else None
+        if stratify_col:
+            df = (
+                df.groupby(stratify_col, group_keys=False)
+                .apply(lambda x: x.sample(max(1, int(max_trials * len(x) / len(df))), random_state=42))
+                .sample(frac=1, random_state=42)
+                .head(max_trials)
+            )
+        else:
+            df = df.sample(max_trials, random_state=42)
     X = df[feats]
     y_raw = df[target].astype(str)
 
@@ -74,6 +90,11 @@ def train_baseline(
 
     report = classification_report(y_test, pred, target_names=encoder.classes_, output_dict=True)
     cm = confusion_matrix(y_test, pred).tolist()
+    overlap = []
+    if "SUBJECT_ID" in df.columns:
+        train_subjects = set(df.loc[train_idx, "SUBJECT_ID"].astype(str))
+        test_subjects = set(df.loc[test_idx, "SUBJECT_ID"].astype(str))
+        overlap = sorted(train_subjects & test_subjects)
 
     model_dir.mkdir(parents=True, exist_ok=True)
     artifact = {
@@ -92,8 +113,12 @@ def train_baseline(
         "classes": encoder.classes_.tolist(),
         "classification_report": report,
         "confusion_matrix": cm,
+        "accuracy": float(accuracy_score(y_test, pred)),
+        "macro_f1": float(f1_score(y_test, pred, average="macro")),
+        "subject_overlap_count": len(overlap),
         "n_train": int(len(train_idx)),
         "n_test": int(len(test_idx)),
+        "n_total_used": int(len(df)),
     }
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     return metrics
@@ -107,6 +132,7 @@ def main() -> None:
     parser.add_argument("--model-type", default="histgb", choices=["histgb", "rf"])
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--rebuild", action="store_true")
+    parser.add_argument("--max-trials", type=int, default=None)
     args = parser.parse_args()
 
     if args.download:
@@ -117,6 +143,7 @@ def main() -> None:
         target=args.target,
         model_type=args.model_type,
         rebuild=args.rebuild,
+        max_trials=args.max_trials,
     )
     print(json.dumps(metrics, indent=2))
 
